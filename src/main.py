@@ -1,0 +1,1194 @@
+import asyncio
+import json
+import re
+import uuid
+import time
+import secrets
+from collections import defaultdict
+from typing import Optional, Dict
+from datetime import datetime, timezone, timedelta
+
+import uvicorn
+from camoufox.async_api import AsyncCamoufox
+from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
+from starlette.responses import HTMLResponse, RedirectResponse
+from fastapi.security import APIKeyHeader
+
+import httpx
+
+# Custom UUIDv7 implementation (using correct Unix epoch)
+def uuid7():
+    """
+    Generate a UUIDv7 using Unix epoch (milliseconds since 1970-01-01)
+    matching the browser's implementation.
+    """
+    timestamp_ms = int(time.time() * 1000)
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+    
+    uuid_int = timestamp_ms << 80
+    uuid_int |= (0x7000 | rand_a) << 64
+    uuid_int |= (0x8000000000000000 | rand_b)
+    
+    hex_str = f"{uuid_int:032x}"
+    return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
+
+app = FastAPI()
+
+# --- Constants & Global State ---
+CONFIG_FILE = "config.json"
+MODELS_FILE = "models.json"
+API_KEY_HEADER = APIKeyHeader(name="Authorization")
+
+# In-memory stores
+# { "api_key": { "conversation_id": session_data } }
+chat_sessions: Dict[str, Dict[str, dict]] = defaultdict(dict)
+# { "session_id": "username" }
+dashboard_sessions = {}
+# { "api_key": [timestamp1, timestamp2, ...] }
+api_key_usage = defaultdict(list)
+# { "model_id": count }
+model_usage_stats = defaultdict(int)
+
+# --- Helper Functions ---
+
+def get_config():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        config = {}
+
+    # Ensure default keys exist
+    config.setdefault("password", "admin")
+    config.setdefault("auth_token", "")
+    config.setdefault("cf_clearance", "")
+    config.setdefault("api_keys", [])
+    config.setdefault("usage_stats", {})
+    # Sync in-memory stats with loaded config
+    global model_usage_stats
+    model_usage_stats = defaultdict(int, config["usage_stats"])
+
+    return config
+
+def save_config(config):
+    # Persist in-memory stats to the config dict before saving
+    config["usage_stats"] = dict(model_usage_stats)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+def get_models():
+    try:
+        with open(MODELS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_models(models):
+    with open(MODELS_FILE, "w") as f:
+        json.dump(models, f, indent=2)
+
+def get_request_headers():
+    config = get_config()
+    auth_token = config.get("auth_token", "").strip()
+    if not auth_token:
+        raise HTTPException(status_code=500, detail="Arena auth token not set in dashboard.")
+    
+    cf_clearance = config.get("cf_clearance", "").strip()
+    return {
+        "Content-Type": "application/json",
+        "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={auth_token}",
+    }
+
+# --- Dashboard Authentication ---
+
+async def get_current_session(request: Request):
+    session_id = request.cookies.get("session_id")
+    if session_id and session_id in dashboard_sessions:
+        return dashboard_sessions[session_id]
+    return None
+
+# --- API Key Authentication & Rate Limiting ---
+
+async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
+    if not key.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401, 
+            detail="Invalid Authorization header. Expected 'Bearer YOUR_API_KEY'"
+        )
+    
+    # Remove "Bearer " prefix and strip whitespace
+    api_key_str = key[7:].strip()
+    config = get_config()
+    
+    key_data = next((k for k in config["api_keys"] if k["key"] == api_key_str), None)
+    if not key_data:
+        raise HTTPException(status_code=401, detail="Invalid API Key.")
+
+    # Rate Limiting
+    rate_limit = key_data.get("rpm", 60)
+    current_time = time.time()
+    
+    # Clean up old timestamps (older than 60 seconds)
+    api_key_usage[api_key_str] = [t for t in api_key_usage[api_key_str] if current_time - t < 60]
+
+    if len(api_key_usage[api_key_str]) >= rate_limit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
+        
+    api_key_usage[api_key_str].append(current_time)
+    
+    return key_data
+
+# --- Core Logic ---
+
+async def get_initial_data():
+    print("Starting initial data retrieval...")
+    try:
+        async with AsyncCamoufox(headless=True) as browser:
+            page = await browser.new_page()
+            
+            print("Navigating to lmarena.ai...")
+            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+
+            print("Waiting for Cloudflare challenge to complete...")
+            try:
+                await page.wait_for_function(
+                    "() => document.title.indexOf('Just a moment...') === -1", 
+                    timeout=45000
+                )
+                print("✅ Cloudflare challenge passed.")
+            except Exception as e:
+                print(f"❌ Cloudflare challenge took too long or failed: {e}")
+                return
+
+            await asyncio.sleep(5)
+
+            # Extract cf_clearance
+            cookies = await page.context.cookies()
+            cf_clearance_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
+            
+            config = get_config()
+            if cf_clearance_cookie:
+                config["cf_clearance"] = cf_clearance_cookie["value"]
+                save_config(config)
+                print(f"✅ Saved cf_clearance token: {cf_clearance_cookie['value'][:20]}...")
+            else:
+                print("⚠️ Could not find cf_clearance cookie.")
+
+            # Extract models
+            print("Extracting models from page...")
+            try:
+                body = await page.content()
+                match = re.search(r'{\\"initialModels\\":(\[.*?\]),\\"initialModel[A-Z]Id', body, re.DOTALL)
+                if match:
+                    models_json = match.group(1).encode().decode('unicode_escape')
+                    models = json.loads(models_json)
+                    save_models(models)
+                    print(f"✅ Saved {len(models)} models")
+                else:
+                    print("⚠️ Could not find models in page")
+            except Exception as e:
+                print(f"❌ Error extracting models: {e}")
+
+            print("✅ Initial data retrieval complete")
+    except Exception as e:
+        print(f"❌ An error occurred during initial data retrieval: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    # Ensure config and models files exist
+    save_config(get_config())
+    save_models(get_models())
+    asyncio.create_task(get_initial_data())
+
+# --- UI Endpoints (Login/Dashboard) ---
+
+@app.get("/", response_class=HTMLResponse)
+async def root_redirect():
+    return RedirectResponse(url="/dashboard")
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, error: Optional[str] = None):
+    if await get_current_session(request):
+        return RedirectResponse(url="/dashboard")
+    
+    error_msg = '<div class="error-message">Invalid password. Please try again.</div>' if error else ''
+    
+    return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Login - LMArena Bridge</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }}
+                .login-container {{
+                    background: white;
+                    padding: 40px;
+                    border-radius: 10px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    width: 100%;
+                    max-width: 400px;
+                }}
+                h1 {{
+                    color: #333;
+                    margin-bottom: 10px;
+                    font-size: 28px;
+                }}
+                .subtitle {{
+                    color: #666;
+                    margin-bottom: 30px;
+                    font-size: 14px;
+                }}
+                .form-group {{
+                    margin-bottom: 20px;
+                }}
+                label {{
+                    display: block;
+                    margin-bottom: 8px;
+                    color: #555;
+                    font-weight: 500;
+                }}
+                input[type="password"] {{
+                    width: 100%;
+                    padding: 12px;
+                    border: 2px solid #e1e8ed;
+                    border-radius: 6px;
+                    font-size: 16px;
+                    transition: border-color 0.3s;
+                }}
+                input[type="password"]:focus {{
+                    outline: none;
+                    border-color: #667eea;
+                }}
+                button {{
+                    width: 100%;
+                    padding: 12px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 16px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: transform 0.2s;
+                }}
+                button:hover {{
+                    transform: translateY(-2px);
+                }}
+                button:active {{
+                    transform: translateY(0);
+                }}
+                .error-message {{
+                    background: #fee;
+                    color: #c33;
+                    padding: 12px;
+                    border-radius: 6px;
+                    margin-bottom: 20px;
+                    border-left: 4px solid #c33;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="login-container">
+                <h1>LMArena Bridge</h1>
+                <div class="subtitle">Sign in to access the dashboard</div>
+                {error_msg}
+                <form action="/login" method="post">
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" placeholder="Enter your password" required autofocus>
+                    </div>
+                    <button type="submit">Sign In</button>
+                </form>
+            </div>
+        </body>
+        </html>
+    """
+
+@app.post("/login")
+async def login_submit(response: Response, password: str = Form(...)):
+    config = get_config()
+    if password == config.get("password"):
+        session_id = str(uuid.uuid4())
+        dashboard_sessions[session_id] = "admin"
+        response = RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+        response.set_cookie(key="session_id", value=session_id, httponly=True)
+        return response
+    return RedirectResponse(url="/login?error=1", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.get("/logout")
+async def logout(request: Request, response: Response):
+    session_id = request.cookies.get("session_id")
+    if session_id in dashboard_sessions:
+        del dashboard_sessions[session_id]
+    response = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie("session_id")
+    return response
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(session: str = Depends(get_current_session)):
+    if not session:
+        return RedirectResponse(url="/login")
+
+    config = get_config()
+    models = get_models()
+
+    # Render API Keys
+    keys_html = ""
+    for key in config["api_keys"]:
+        created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
+        keys_html += f"""
+            <tr>
+                <td><strong>{key['name']}</strong></td>
+                <td><code class="api-key-code">{key['key']}</code></td>
+                <td><span class="badge">{key['rpm']} RPM</span></td>
+                <td><small>{created_date}</small></td>
+                <td>
+                    <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
+                        <input type='hidden' name='key_id' value='{key['key']}'>
+                        <button type='submit' class='btn-delete'>Delete</button>
+                    </form>
+                </td>
+            </tr>
+        """
+
+    # Render Models (limit to first 20 with text output)
+    text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
+    models_html = ""
+    for i, model in enumerate(text_models[:20]):
+        rank = model.get('rank', '?')
+        org = model.get('organization', 'Unknown')
+        models_html += f"""
+            <div class="model-card">
+                <div class="model-header">
+                    <span class="model-name">{model.get('publicName', 'Unnamed')}</span>
+                    <span class="model-rank">Rank {rank}</span>
+                </div>
+                <div class="model-org">{org}</div>
+            </div>
+        """
+    
+    if not models_html:
+        models_html = '<div class="no-data">No models found. Token may be invalid or expired.</div>'
+
+    # Render Stats
+    stats_html = ""
+    if model_usage_stats:
+        for model, count in sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
+            stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
+    else:
+        stats_html = "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
+
+    # Check token status
+    token_status = "✅ Configured" if config.get("auth_token") else "❌ Not Set"
+    token_class = "status-good" if config.get("auth_token") else "status-bad"
+    
+    cf_status = "✅ Configured" if config.get("cf_clearance") else "❌ Not Set"
+    cf_class = "status-good" if config.get("cf_clearance") else "status-bad"
+
+    return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Dashboard - LMArena Bridge</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    background: #f5f7fa;
+                    color: #333;
+                    line-height: 1.6;
+                }}
+                .header {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 20px 0;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }}
+                .header-content {{
+                    max-width: 1200px;
+                    margin: 0 auto;
+                    padding: 0 20px;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                }}
+                h1 {{
+                    font-size: 24px;
+                    font-weight: 600;
+                }}
+                .logout-btn {{
+                    background: rgba(255,255,255,0.2);
+                    color: white;
+                    padding: 8px 16px;
+                    border-radius: 6px;
+                    text-decoration: none;
+                    transition: background 0.3s;
+                }}
+                .logout-btn:hover {{
+                    background: rgba(255,255,255,0.3);
+                }}
+                .container {{
+                    max-width: 1200px;
+                    margin: 30px auto;
+                    padding: 0 20px;
+                }}
+                .section {{
+                    background: white;
+                    border-radius: 10px;
+                    padding: 25px;
+                    margin-bottom: 25px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+                }}
+                .section-header {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 20px;
+                    padding-bottom: 15px;
+                    border-bottom: 2px solid #f0f0f0;
+                }}
+                h2 {{
+                    font-size: 20px;
+                    color: #333;
+                    font-weight: 600;
+                }}
+                .status-badge {{
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    font-weight: 600;
+                }}
+                .status-good {{ background: #d4edda; color: #155724; }}
+                .status-bad {{ background: #f8d7da; color: #721c24; }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                }}
+                th {{
+                    background: #f8f9fa;
+                    padding: 12px;
+                    text-align: left;
+                    font-weight: 600;
+                    color: #555;
+                    font-size: 14px;
+                    border-bottom: 2px solid #e9ecef;
+                }}
+                td {{
+                    padding: 12px;
+                    border-bottom: 1px solid #f0f0f0;
+                }}
+                tr:hover {{
+                    background: #f8f9fa;
+                }}
+                .form-group {{
+                    margin-bottom: 15px;
+                }}
+                label {{
+                    display: block;
+                    margin-bottom: 6px;
+                    font-weight: 500;
+                    color: #555;
+                }}
+                input[type="text"], input[type="number"], textarea {{
+                    width: 100%;
+                    padding: 10px;
+                    border: 2px solid #e1e8ed;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-family: inherit;
+                    transition: border-color 0.3s;
+                }}
+                input:focus, textarea:focus {{
+                    outline: none;
+                    border-color: #667eea;
+                }}
+                textarea {{
+                    resize: vertical;
+                    font-family: 'Courier New', monospace;
+                    min-height: 100px;
+                }}
+                button, .btn {{
+                    padding: 10px 20px;
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.3s;
+                }}
+                button[type="submit"]:not(.btn-delete) {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                }}
+                button[type="submit"]:not(.btn-delete):hover {{
+                    transform: translateY(-2px);
+                    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+                }}
+                .btn-delete {{
+                    background: #dc3545;
+                    color: white;
+                    padding: 6px 12px;
+                    font-size: 13px;
+                }}
+                .btn-delete:hover {{
+                    background: #c82333;
+                }}
+                .api-key-code {{
+                    background: #f8f9fa;
+                    padding: 4px 8px;
+                    border-radius: 4px;
+                    font-family: 'Courier New', monospace;
+                    font-size: 12px;
+                    color: #495057;
+                }}
+                .badge {{
+                    background: #e7f3ff;
+                    color: #0066cc;
+                    padding: 4px 8px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    font-weight: 600;
+                }}
+                .model-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                    gap: 15px;
+                    margin-top: 15px;
+                }}
+                .model-card {{
+                    background: #f8f9fa;
+                    padding: 15px;
+                    border-radius: 8px;
+                    border-left: 4px solid #667eea;
+                }}
+                .model-header {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 8px;
+                }}
+                .model-name {{
+                    font-weight: 600;
+                    color: #333;
+                    font-size: 14px;
+                }}
+                .model-rank {{
+                    background: #667eea;
+                    color: white;
+                    padding: 2px 8px;
+                    border-radius: 12px;
+                    font-size: 11px;
+                    font-weight: 600;
+                }}
+                .model-org {{
+                    color: #666;
+                    font-size: 12px;
+                }}
+                .no-data {{
+                    text-align: center;
+                    color: #999;
+                    padding: 20px;
+                    font-style: italic;
+                }}
+                .stats-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 20px;
+                    margin-bottom: 20px;
+                }}
+                .stat-card {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                    text-align: center;
+                }}
+                .stat-value {{
+                    font-size: 32px;
+                    font-weight: bold;
+                    margin-bottom: 5px;
+                }}
+                .stat-label {{
+                    font-size: 14px;
+                    opacity: 0.9;
+                }}
+                .form-row {{
+                    display: grid;
+                    grid-template-columns: 2fr 1fr auto;
+                    gap: 10px;
+                    align-items: end;
+                }}
+                @media (max-width: 768px) {{
+                    .form-row {{
+                        grid-template-columns: 1fr;
+                    }}
+                    .model-grid {{
+                        grid-template-columns: 1fr;
+                    }}
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <div class="header-content">
+                    <h1>🚀 LMArena Bridge Dashboard</h1>
+                    <a href="/logout" class="logout-btn">Logout</a>
+                </div>
+            </div>
+
+            <div class="container">
+                <!-- Stats Overview -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-value">{len(config['api_keys'])}</div>
+                        <div class="stat-label">API Keys</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">{len(text_models)}</div>
+                        <div class="stat-label">Available Models</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">{sum(model_usage_stats.values())}</div>
+                        <div class="stat-label">Total Requests</div>
+                    </div>
+                </div>
+
+                <!-- Arena Auth Token -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>🔐 Arena Authentication</h2>
+                        <span class="status-badge {token_class}">{token_status}</span>
+                    </div>
+                    <form action="/update-auth-token" method="post">
+                        <div class="form-group">
+                            <label for="auth_token">Arena Auth Token</label>
+                            <textarea id="auth_token" name="auth_token" placeholder="Paste your arena-auth-prod-v1 token here">{config.get("auth_token", "")}</textarea>
+                        </div>
+                        <button type="submit">Update Token</button>
+                    </form>
+                </div>
+
+                <!-- Cloudflare Clearance -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>☁️ Cloudflare Clearance</h2>
+                        <span class="status-badge {cf_class}">{cf_status}</span>
+                    </div>
+                    <p style="color: #666; margin-bottom: 15px;">This is automatically fetched on startup. If API requests fail with 404 errors, the token may have expired.</p>
+                    <code style="background: #f8f9fa; padding: 10px; display: block; border-radius: 6px; word-break: break-all; margin-bottom: 15px;">
+                        {config.get("cf_clearance", "Not set")}
+                    </code>
+                    <form action="/refresh-tokens" method="post" style="margin-top: 15px;">
+                        <button type="submit" style="background: #28a745;">🔄 Refresh Tokens &amp; Models</button>
+                    </form>
+                    <p style="color: #999; font-size: 13px; margin-top: 10px;"><em>Note: This will fetch a fresh cf_clearance token and update the model list.</em></p>
+                </div>
+
+                <!-- API Keys -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>🔑 API Keys</h2>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Key</th>
+                                <th>Rate Limit</th>
+                                <th>Created</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {keys_html if keys_html else '<tr><td colspan="5" class="no-data">No API keys configured</td></tr>'}
+                        </tbody>
+                    </table>
+                    
+                    <h3 style="margin-top: 30px; margin-bottom: 15px; font-size: 18px;">Create New API Key</h3>
+                    <form action="/create-key" method="post">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="name">Key Name</label>
+                                <input type="text" id="name" name="name" placeholder="e.g., Production Key" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="rpm">Rate Limit (RPM)</label>
+                                <input type="number" id="rpm" name="rpm" value="60" min="1" max="1000" required>
+                            </div>
+                            <div class="form-group">
+                                <label>&nbsp;</label>
+                                <button type="submit">Create Key</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Usage Statistics -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>📊 Usage Statistics</h2>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Model</th>
+                                <th>Requests</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {stats_html}
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Available Models -->
+                <div class="section">
+                    <div class="section-header">
+                        <h2>🤖 Available Models</h2>
+                    </div>
+                    <p style="color: #666; margin-bottom: 15px;">Showing top 20 text-based models (Rank 1 = Best)</p>
+                    <div class="model-grid">
+                        {models_html}
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+    """
+
+@app.post("/update-auth-token")
+async def update_auth_token(session: str = Depends(get_current_session), auth_token: str = Form(...)):
+    if not session:
+        return RedirectResponse(url="/login")
+    config = get_config()
+    config["auth_token"] = auth_token.strip()
+    save_config(config)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/create-key")
+async def create_key(session: str = Depends(get_current_session), name: str = Form(...), rpm: int = Form(...)):
+    if not session:
+        return RedirectResponse(url="/login")
+    config = get_config()
+    new_key = {
+        "name": name.strip(),
+        "key": f"sk-lmab-{uuid.uuid4()}",
+        "rpm": max(1, min(rpm, 1000)),  # Clamp between 1-1000
+        "created": int(time.time())
+    }
+    config["api_keys"].append(new_key)
+    save_config(config)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/delete-key")
+async def delete_key(session: str = Depends(get_current_session), key_id: str = Form(...)):
+    if not session:
+        return RedirectResponse(url="/login")
+    config = get_config()
+    config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
+    save_config(config)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/refresh-tokens")
+async def refresh_tokens(session: str = Depends(get_current_session)):
+    if not session:
+        return RedirectResponse(url="/login")
+    await get_initial_data()
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+# --- OpenAI Compatible API Endpoints ---
+
+@app.get("/api/v1/models")
+async def list_models(api_key: dict = Depends(rate_limit_api_key)):
+    models = get_models()
+    # Filter for text-based models
+    text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
+    
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model.get("publicName"),
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": model.get("organization", "lmarena")
+            } for model in text_models if model.get("publicName")
+        ]
+    }
+
+@app.post("/api/v1/chat/completions")
+async def api_chat_completions(request: Request, api_key: dict = Depends(rate_limit_api_key)):
+    print("\n" + "="*80)
+    print("🔵 NEW API REQUEST RECEIVED")
+    print("="*80)
+    
+    try:
+        body = await request.json()
+        print(f"📥 Request body keys: {list(body.keys())}")
+        
+        model_public_name = body.get("model")
+        messages = body.get("messages", [])
+        
+        print(f"🤖 Requested model: {model_public_name}")
+        print(f"💬 Number of messages: {len(messages)}")
+        
+        if not model_public_name or not messages:
+            print("❌ Missing model or messages in request")
+            raise HTTPException(status_code=400, detail="Missing 'model' or 'messages' in request body.")
+
+        # Find model ID from public name
+        models = get_models()
+        print(f"📚 Total models loaded: {len(models)}")
+        
+        model_id = None
+        for m in models:
+            if m.get("publicName") == model_public_name:
+                model_id = m.get("id")
+                break
+        
+        if not model_id:
+            print(f"❌ Model '{model_public_name}' not found in model list")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Model '{model_public_name}' not found. Use /api/v1/models to see available models."
+            )
+        
+        print(f"✅ Found model ID: {model_id}")
+
+        # Log usage
+        model_usage_stats[model_public_name] += 1
+        config = get_config()
+        save_config(config)
+
+        # Use last message as prompt
+        prompt = messages[-1].get("content", "")
+        print(f"📝 User prompt: {prompt[:100]}..." if len(prompt) > 100 else f"📝 User prompt: {prompt}")
+        
+        if not prompt:
+            print("❌ Last message has no content")
+            raise HTTPException(status_code=400, detail="Last message must have content.")
+        
+        # Use API key + conversation tracking
+        api_key_str = api_key["key"]
+        conversation_id = body.get("conversation_id", f"conv-{uuid.uuid4()}")
+        
+        print(f"🔑 API Key: {api_key_str[:20]}...")
+        print(f"💭 Conversation ID: {conversation_id}")
+        
+        headers = get_request_headers()
+        print(f"📋 Headers prepared (auth token length: {len(headers.get('Cookie', '').split('arena-auth-prod-v1=')[-1].split(';')[0])} chars)")
+        
+        # Check if conversation exists for this API key
+        session = chat_sessions[api_key_str].get(conversation_id)
+        
+        if not session:
+            print("🆕 Creating NEW conversation session")
+            # New conversation - Generate all IDs at once (like the browser does)
+            session_id = str(uuid7())
+            user_msg_id = str(uuid7())
+            model_msg_id = str(uuid7())
+            
+            print(f"🔑 Generated session_id: {session_id}")
+            print(f"👤 Generated user_msg_id: {user_msg_id}")
+            print(f"🤖 Generated model_msg_id: {model_msg_id}")
+            
+            payload = {
+                "id": session_id,
+                "mode": "direct",
+                "modelAId": model_id,
+                "userMessageId": user_msg_id,
+                "modelAMessageId": model_msg_id,
+                "messages": [
+                    {
+                        "id": user_msg_id,
+                        "role": "user",
+                        "content": prompt,
+                        "experimental_attachments": [],
+                        "parentMessageIds": [],
+                        "participantPosition": "a",
+                        "modelId": None,
+                        "evaluationSessionId": session_id,
+                        "status": "pending",
+                        "failureReason": None
+                    },
+                    {
+                        "id": model_msg_id,
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning": "",
+                        "experimental_attachments": [],
+                        "parentMessageIds": [user_msg_id],
+                        "participantPosition": "a",
+                        "modelId": model_id,
+                        "evaluationSessionId": session_id,
+                        "status": "pending",
+                        "failureReason": None
+                    }
+                ],
+                "modality": "chat"
+            }
+            url = "https://lmarena.ai/nextjs-api/stream/create-evaluation"
+            print(f"📤 Target URL: {url}")
+            print(f"📦 Payload structure: {len(payload['messages'])} messages")
+        else:
+            print("🔄 Using EXISTING conversation session")
+            # Follow-up message - Generate message IDs close together
+            user_msg_id = str(uuid7())
+            print(f"👤 Generated followup user_msg_id: {user_msg_id}")
+            model_msg_id = str(uuid7())
+            print(f"🤖 Generated followup model_msg_id: {model_msg_id}")
+            
+            # Build full conversation history from messages
+            conversation_messages = []
+            for i, msg in enumerate(messages[:-1]):  # All but last message
+                msg_id = str(uuid7()) if i > 0 else session.get("first_user_msg_id", str(uuid7()))
+                conversation_messages.append({
+                    "id": msg_id,
+                    "role": msg["role"],
+                    "content": msg["content"],
+                    "experimental_attachments": [],
+                    "parentMessageIds": [conversation_messages[-1]["id"]] if conversation_messages else [],
+                    "participantPosition": "a",
+                    "modelId": model_id if msg["role"] == "assistant" else None,
+                    "evaluationSessionId": session["conversation_id"],
+                    "status": "success" if msg["role"] == "assistant" else "pending",
+                    "failureReason": None
+                })
+                if msg["role"] == "assistant":
+                    conversation_messages[-1]["reasoning"] = ""
+            
+            # Add new user message
+            last_msg_id = conversation_messages[-1]["id"] if conversation_messages else session.get("last_message_id", str(uuid7()))
+            conversation_messages.append({
+                "id": user_msg_id,
+                "role": "user",
+                "content": prompt,
+                "experimental_attachments": [],
+                "parentMessageIds": [last_msg_id],
+                "participantPosition": "a",
+                "modelId": None,
+                "evaluationSessionId": session["conversation_id"],
+                "status": "pending",
+                "failureReason": None
+            })
+            
+            # Add pending assistant message
+            conversation_messages.append({
+                "id": model_msg_id,
+                "role": "assistant",
+                "content": "",
+                "reasoning": "",
+                "experimental_attachments": [],
+                "parentMessageIds": [user_msg_id],
+                "participantPosition": "a",
+                "modelId": model_id,
+                "evaluationSessionId": session["conversation_id"],
+                "status": "pending",
+                "failureReason": None
+            })
+            
+            payload = {
+                "id": session["conversation_id"],
+                "mode": "direct",
+                "modelAId": model_id,
+                "userMessageId": user_msg_id,
+                "modelAMessageId": model_msg_id,
+                "messages": conversation_messages,
+                "modality": "chat"
+            }
+            url = f"https://lmarena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
+            print(f"📤 Target URL: {url}")
+            print(f"📦 Payload structure: {len(payload['messages'])} messages")
+
+        print(f"\n🚀 Making API request to LMArena...")
+        print(f"⏱️  Timeout set to: 120 seconds")
+        
+        async with httpx.AsyncClient() as client:
+            try:
+                print("📡 Sending POST request...")
+                response = await client.post(url, json=payload, headers=headers, timeout=120)
+                
+                print(f"✅ Response received - Status: {response.status_code}")
+                print(f"📏 Response length: {len(response.text)} characters")
+                print(f"📋 Response headers: {dict(response.headers)}")
+                
+                response.raise_for_status()
+                
+                print(f"🔍 Processing response...")
+                print(f"📄 First 500 chars of response:\n{response.text[:500]}")
+                
+                # Process response in lmarena format
+                # Format: a0:"text chunk" for content, ad:{...} for metadata
+                response_text = ""
+                finish_reason = None
+                line_count = 0
+                text_chunks_found = 0
+                metadata_found = 0
+                
+                print(f"📊 Parsing response lines...")
+                
+                error_message = None
+                for line in response.text.splitlines():
+                    line_count += 1
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Parse text chunks: a0:"Hello "
+                    if line.startswith("a0:"):
+                        chunk_data = line[3:]  # Remove "a0:" prefix
+                        text_chunks_found += 1
+                        try:
+                            # Parse as JSON string (includes quotes)
+                            text_chunk = json.loads(chunk_data)
+                            response_text += text_chunk
+                            if text_chunks_found <= 3:  # Log first 3 chunks
+                                print(f"  ✅ Chunk {text_chunks_found}: {repr(text_chunk[:50])}")
+                        except json.JSONDecodeError as e:
+                            print(f"  ⚠️ Failed to parse text chunk on line {line_count}: {chunk_data[:100]} - {e}")
+                            continue
+                    
+                    # Parse error messages: a3:"An error occurred"
+                    elif line.startswith("a3:"):
+                        error_data = line[3:]  # Remove "a3:" prefix
+                        try:
+                            error_message = json.loads(error_data)
+                            print(f"  ❌ Error message received: {error_message}")
+                        except json.JSONDecodeError as e:
+                            print(f"  ⚠️ Failed to parse error message on line {line_count}: {error_data[:100]} - {e}")
+                            error_message = error_data
+                    
+                    # Parse metadata: ad:{"finishReason":"stop"}
+                    elif line.startswith("ad:"):
+                        metadata_data = line[3:]  # Remove "ad:" prefix
+                        metadata_found += 1
+                        try:
+                            metadata = json.loads(metadata_data)
+                            finish_reason = metadata.get("finishReason")
+                            print(f"  📋 Metadata found: finishReason={finish_reason}")
+                        except json.JSONDecodeError as e:
+                            print(f"  ⚠️ Failed to parse metadata on line {line_count}: {metadata_data[:100]} - {e}")
+                            continue
+                    elif line.strip():  # Non-empty line that doesn't match expected format
+                        if line_count <= 5:  # Log first 5 unexpected lines
+                            print(f"  ❓ Unexpected line format {line_count}: {line[:100]}")
+
+                print(f"\n📊 Parsing Summary:")
+                print(f"  - Total lines: {line_count}")
+                print(f"  - Text chunks found: {text_chunks_found}")
+                print(f"  - Metadata entries: {metadata_found}")
+                print(f"  - Final response length: {len(response_text)} chars")
+                print(f"  - Finish reason: {finish_reason}")
+                
+                if not response_text:
+                    print(f"\n⚠️  WARNING: Empty response text!")
+                    print(f"📄 Full raw response:\n{response.text}")
+                    if error_message:
+                        error_detail = f"LMArena API returned an error: {error_message}"
+                        print(f"❌ Raising HTTPException with error: {error_detail}")
+                        raise HTTPException(status_code=502, detail=error_detail)
+                    else:
+                        error_detail = "LMArena API returned empty response. This could be due to: invalid auth token, expired cf_clearance, model unavailable, or API rate limiting."
+                        print(f"❌ Raising HTTPException: {error_detail}")
+                        raise HTTPException(status_code=502, detail=error_detail)
+                else:
+                    print(f"✅ Response text preview: {response_text[:200]}...")
+                
+                # Update session
+                if not session:
+                    chat_sessions[api_key_str][conversation_id] = {
+                        "conversation_id": session_id,
+                        "last_message_id": model_msg_id,
+                        "model": model_public_name
+                    }
+                    print(f"💾 Saved new session for conversation {conversation_id}")
+                else:
+                    chat_sessions[api_key_str][conversation_id]["last_message_id"] = model_msg_id
+                    print(f"💾 Updated existing session for conversation {conversation_id}")
+
+                final_response = {
+                    "id": f"chatcmpl-{uuid.uuid4()}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model_public_name,
+                    "conversation_id": conversation_id,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": response_text.strip(),
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": len(prompt),
+                        "completion_tokens": len(response_text),
+                        "total_tokens": len(prompt) + len(response_text)
+                    }
+                }
+                
+                print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
+                print("="*80 + "\n")
+                
+                return final_response
+
+            except httpx.HTTPStatusError as e:
+                error_detail = f"LMArena API error: {e.response.status_code}"
+                try:
+                    error_body = e.response.json()
+                    error_detail += f" - {error_body}"
+                except:
+                    error_detail += f" - {e.response.text[:200]}"
+                print(f"\n❌ HTTP STATUS ERROR")
+                print(f"📛 Error detail: {error_detail}")
+                print(f"📤 Request URL: {url}")
+                print(f"📤 Request payload (truncated): {json.dumps(payload, indent=2)[:500]}")
+                print(f"📥 Response text: {e.response.text[:500]}")
+                print("="*80 + "\n")
+                raise HTTPException(status_code=502, detail=error_detail)
+            
+            except httpx.TimeoutException as e:
+                print(f"\n⏱️  TIMEOUT ERROR")
+                print(f"📛 Request timed out after 120 seconds")
+                print(f"📤 Request URL: {url}")
+                print("="*80 + "\n")
+                raise HTTPException(status_code=504, detail="Request to LMArena API timed out")
+            
+            except Exception as e:
+                print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
+                print(f"📛 Error type: {type(e).__name__}")
+                print(f"📛 Error message: {str(e)}")
+                print(f"📤 Request URL: {url}")
+                print("="*80 + "\n")
+                raise
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\n❌ TOP-LEVEL EXCEPTION")
+        print(f"📛 Error type: {type(e).__name__}")
+        print(f"📛 Error message: {str(e)}")
+        print("="*80 + "\n")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🚀 LMArena Bridge Server Starting...")
+    print("=" * 60)
+    print(f"📍 Dashboard: http://localhost:8000/dashboard")
+    print(f"🔐 Login: http://localhost:8000/login")
+    print(f"📚 API Base URL: http://localhost:8000/api/v1")
+    print("=" * 60)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
